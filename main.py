@@ -1,108 +1,66 @@
-import asyncio
-import struct
-from bleak import BleakScanner, BleakClient
-from rich.console import Console
-from rich import inspect
+import serial
+import time
 from pythonosc import udp_client
+from rich.console import Console
 
 # --- Configuration ---
-DEVICE_NAME_FILTER = "colinXIAO"
-TARGET_CHAR_UUID = "c46d641f-0926-40a6-bdcf-60230fc1f205"
+SERIAL_PORT = "COM6"  # <-- Change this to your Receiver ESP32's COM port!
+BAUD_RATE = 115200
 TD_IP = "127.0.0.1"
 TD_PORT = 8000
 
-# --- Initialize Tools ---
 console = Console()
 osc_client = udp_client.SimpleUDPClient(TD_IP, TD_PORT)
 
-# Thread-safe async events and queues
-exit_event = asyncio.Event()
-data_queue = asyncio.Queue()
-
-async def process_data():
-    """
-    Background task to unpack data and send to TouchDesigner.
-    Acts as a fast pipe, dropping old packets to prevent lag and filtering bad MTU fragments.
-    """
-    while not exit_event.is_set():
-        try:
-            # Wait for data to appear in the queue
-            data = await asyncio.wait_for(data_queue.get(), timeout=0.5)
-            
-            # --- ANTI-LAG: Drain the queue ---
-            # If the PC receives a burst of packets, we only care about the MOST RECENT one.
-            # This throws away stale physical data to keep the TD stream real-time.
-            while not data_queue.empty():
-                data = data_queue.get_nowait()
-
-            # --- ANTI-JUNK: Packet Size Validation ---
-            # Ensure we actually have 24 bytes before attempting to unpack.
-            # If the PC's Bluetooth adapter is fragmenting packets, this catches it.
-            if len(data) != 24:
-                console.print(f"[yellow]Ignored fragmented packet: {len(data)} bytes (expected 24)[/yellow]")
-                continue
-
-            # 1. Unpack the 24 raw bytes into 6 floats (Little-endian)
-            ax, ay, az, gx, gy, gz = struct.unpack('<ffffff', data)
-
-            # 2. Send to TouchDesigner via OSC as fast as possible
-            osc_client.send_message("/mpu6050/accel", [ax, ay, az])
-            osc_client.send_message("/mpu6050/gyro", [gx, gy, gz])
-
-        except asyncio.TimeoutError:
-            # Normal timeout if the ESP32 hasn't sent anything, keep waiting
-            continue
-        except struct.error as e:
-            console.print(f"[bold red]Struct Unpack Error (Junk Data): {e}[/bold red]")
-        except Exception as e:
-            console.print(f"[red]Error processing data: {e}[/red]")
-
-async def main():
-    console.print(f"Scanning for device containing: '{DEVICE_NAME_FILTER}'...")
+def main():
+    console.print(f"[cyan]Connecting to Receiver ESP32 on {SERIAL_PORT}...[/cyan]")
     
-    device = await BleakScanner.find_device_by_filter(
-        lambda bd, ad: bd.name and DEVICE_NAME_FILTER in bd.name, timeout=15
-    )
-    
-    if device is None:
-        console.print("[bold red]Device not found. Make sure the ESP32 is on and advertising.[/bold red]")
-        return
-
-    # Print device details to confirm we found the right one
-    console.print("\n[bold green]Device Found![/bold green]")
-    inspect(device)
-    
-    async with BleakClient(device) as client:
-        # THE CALLBACK: This is lightning fast. 
-        # It only drops the raw bytes into the queue and immediately finishes.
-        def callback_data(sender, data):
-            data_queue.put_nowait(data)
-
-        characteristic = client.services.get_characteristic(TARGET_CHAR_UUID)
-
-        if characteristic:
-            await client.start_notify(characteristic, callback_data)
-            console.print(f"[bold cyan]Connected! Listening for MPU6050 data and sending to TD...[/bold cyan]")
-            console.print("[dim](Press Ctrl+C to stop)[/dim]")
-            
-            # Start the background consumer task
-            processor_task = asyncio.create_task(process_data())
-            
-            try:
-                # Keep the main loop alive until we receive an exit signal
-                await exit_event.wait()
-            finally:
-                # Clean up when closing
-                await client.stop_notify(characteristic)
-                processor_task.cancel()
-        else:
-            console.print(f"[bold red]UUID {TARGET_CHAR_UUID} not found on this device![/bold red]")
+    try:
+        # Open the serial port
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+        time.sleep(2) # Brief pause to allow the Arduino to reset on connection
+        
+        console.print("[bold green]Connected! Forwarding ESP-NOW data to TouchDesigner.[/bold green]")
+        console.print("[dim]Listening for DATA packets and Serial Debug messages... (Press Ctrl+C to stop)[/dim]\n")
+        
+        while True:
+            if ser.in_waiting > 0:
+                # Read the incoming line from the USB cable
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                
+                # 1. Catch the live sensor stream
+                if line.startswith("DATA:"):
+                    raw_data = line.replace("DATA:", "")
+                    parts = raw_data.split(",")
+                    
+                    if len(parts) == 6:
+                        try:
+                            # Convert string values back to floats
+                            ax, ay, az, gx, gy, gz = map(float, parts)
+                            
+                            # Blast the floats to TouchDesigner via OSC
+                            osc_client.send_message("/mpu6050/accel", [ax, ay, az])
+                            osc_client.send_message("/mpu6050/gyro", [gx, gy, gz])
+                            
+                        except ValueError:
+                            # Silently ignore any mangled string fragments if a bit flips
+                            pass 
+                
+                # 2. Print all other Serial debug messages to the console
+                # This ensures your standard Arduino debug outputs are preserved
+                elif line:
+                    console.print(f"[yellow]ESP32 Debug:[/yellow] [dim]{line}[/dim]")
+                    
+    except serial.SerialException as e:
+        console.print(f"\n[bold red]Could not open {SERIAL_PORT}.[/bold red]")
+        console.print("Is the board plugged in, and is the Arduino IDE Serial Monitor closed?")
+        console.print(f"[red]Error details: {e}[/red]")
+    except KeyboardInterrupt:
+        console.print("\n[bold red]Script stopped gracefully by user.[/bold red]")
+    finally:
+        if 'ser' in locals() and ser.is_open:
+            ser.close()
+            console.print("[dim]Serial port closed.[/dim]")
 
 if __name__ == "__main__":
-    try:
-        # Run the main loop
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        # This gracefully catches when you physically press Ctrl+C
-        exit_event.set()
-        console.print("\n[bold red]Program exited gracefully by user.[/bold red]")
+    main()
